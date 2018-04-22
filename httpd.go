@@ -1,27 +1,34 @@
 package httpd
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"os/signal"
+	"strconv"
 	"time"
 )
 
 // Httpd main struct
 type Httpd struct {
-	server *http.Server
-	mux    *http.ServeMux
+	Address string
+	server  *http.Server
+	mux     *http.ServeMux
 }
 
 // New creates a new Httpd instance
-func New() *Httpd {
+func New(options ...func(*Httpd) error) (*Httpd, error) {
 	h := &Httpd{}
 	h.mux = http.NewServeMux()
 
 	h.server = &http.Server{
 		Handler:        h,
-		ReadTimeout:    10 * time.Second,
+		ReadTimeout:    5 * time.Second,
 		WriteTimeout:   10 * time.Second,
+		IdleTimeout:    15 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -32,7 +39,20 @@ func New() *Httpd {
 	h.mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	h.mux.HandleFunc("/debug/pprof/", pprof.Index)
 
-	return h
+	for _, option := range options {
+		err := option(h)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return h, nil
+}
+
+func Port(port int) func(*Httpd) error {
+	return func(h *Httpd) error {
+		h.Address = ":" + strconv.Itoa(port)
+		return nil
+	}
 }
 
 func (h *Httpd) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +65,9 @@ func (h *Httpd) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Log results
 	userAgent := r.Header["User-Agent"]
 	referer := r.Header["Referer"]
+	if len(referer) == 0 {
+		referer = []string{""}
+	}
 	userID := "-"
 	fmt.Printf("%s - %s [%s] \"%s %s %s\" %d %d \"%s\" \"%s\" \"-\"\n",
 		r.RemoteAddr,
@@ -58,7 +81,6 @@ func (h *Httpd) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		referer[0],
 		userAgent[0],
 	)
-	//spew.Dump(r)
 }
 
 // HandleFunc adds a route to the map of handlers
@@ -74,8 +96,31 @@ func (h *Httpd) Handle(route string, handler http.Handler) {
 }
 
 // ListenAndServe starts Httpd listening on the defined address
-func (h *Httpd) ListenAndServe(address string) error {
-	h.server.Addr = address
-	fmt.Println("Serving on", address)
-	return h.server.ListenAndServe()
+func (h *Httpd) ListenAndServe(address ...string) error {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	go h.HandleSignal(quit)
+
+	h.server.Addr = h.Address
+	if len(address) > 0 {
+		h.server.Addr = address[0]
+	}
+	fmt.Println("Serving on", h.server.Addr)
+	err := h.server.ListenAndServe()
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (h *Httpd) HandleSignal(q chan os.Signal) {
+	<-q
+	log.Println("Server is shutting down")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	h.server.SetKeepAlivesEnabled(false)
+	if err := h.server.Shutdown(ctx); err != nil {
+		log.Fatalf("Could not gracefully shutdown the server: %v\n", err)
+	}
 }
